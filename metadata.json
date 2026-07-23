@@ -1,0 +1,6 @@
+{
+  "name": "Three-Way Match & Exception Management",
+  "description": "Data-driven SME Accounts Payable 3-way matching system with duplicate detection, line-item reconciliation, plain-language exception explanations, and audit logging.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
