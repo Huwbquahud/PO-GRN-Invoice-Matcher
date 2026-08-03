@@ -20,6 +20,7 @@ import {
   benchmarkSampleInvoices,
 } from "../data/seedData";
 import { performThreeWayMatch } from "../utils/matchingEngine";
+import { autoSyncInvoiceToSheet } from "../services/sheetsExport";
 
 const STORAGE_KEYS = {
   POS: "ap_3way_purchase_orders_v_clean_1",
@@ -105,12 +106,17 @@ export function useAPStore() {
 
   // Run match for any given invoice
   const runMatch = (invoice: Invoice): MatchResult => {
-    return performThreeWayMatch(
+    const result = performThreeWayMatch(
       invoice,
       purchaseOrders,
       grns,
       paymentHistory
     );
+
+    // AUTOMATIC EXPORT: Trigger Google Sheet auto-export on classification
+    autoSyncInvoiceToSheet(invoice, result);
+
+    return result;
   };
 
   // Add Brand New Unseen PO + GRN + Invoice test
@@ -225,18 +231,24 @@ export function useAPStore() {
     setExceptionLogs((prev) => [newLogEntry, ...prev]);
 
     // 2. Update Invoice status
+    const updatedInvoice: Invoice = {
+      ...invoice,
+      status: newInvoiceStatus,
+      reviewNotes: notes,
+      reviewedBy: "Madam Lim",
+      reviewedAt: timestamp,
+    };
+
     setVerifiedInvoices((prev) =>
-      prev.map((inv) =>
-        inv.id === invoice.id
-          ? {
-              ...inv,
-              status: newInvoiceStatus,
-              reviewNotes: notes,
-              reviewedBy: "Madam Lim",
-              reviewedAt: timestamp,
-            }
-          : inv
-      )
+      prev.map((inv) => (inv.id === invoice.id ? updatedInvoice : inv))
+    );
+
+    // AUTOMATIC EXPORT: Trigger Google Sheet auto-export on decision change (moves invoice between tabs if needed)
+    const effectiveMatchStatus = newInvoiceStatus === "APPROVED" ? "Approved" : newInvoiceStatus === "REJECTED" ? "Red" : matchResult.overallStatus;
+    autoSyncInvoiceToSheet(
+      updatedInvoice,
+      { ...matchResult, overallStatus: effectiveMatchStatus as any },
+      newInvoiceStatus
     );
 
     // 3. If Approved, add to "Approved for Payment" tab AND update Payment History (for duplicate detection!)

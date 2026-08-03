@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { Header } from "./components/Header";
+import { GoogleSheetsSyncBar } from "./components/GoogleSheetsSyncBar";
 import { TestBenchBanner } from "./components/TestBenchBanner";
 import { InvoiceProcessor } from "./components/InvoiceProcessor";
 import { DataHub } from "./components/DataHub";
@@ -106,6 +107,9 @@ export default function App() {
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 font-sans flex flex-col">
       
+      {/* Target Google Sheet Settings & Live Sync Status Bar */}
+      <GoogleSheetsSyncBar />
+
       {/* Top Application Navigation & User Header */}
       <Header
         pendingCount={pendingCount}

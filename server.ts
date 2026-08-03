@@ -15,7 +15,7 @@ const __dirname = path.dirname(__filename);
 
 // Helper function to call Gemini API with model fallback if rate limits or availability errors occur
 async function generateContentWithFallback(ai: GoogleGenAI, contents: any, config: any) {
-  const models = ["gemini-3.6-flash", "gemini-2.0-flash"];
+  const models = ["gemini-2.5-flash", "gemini-3.6-flash"];
   let lastError: any = null;
 
   for (const model of models) {
@@ -172,15 +172,35 @@ function localParseInvoice(text: string, base64Data?: string, _mimeType?: string
     totalAmount = lineItems.reduce((acc, item) => acc + item.total, 0);
   }
 
+  const mappedLineItems = lineItems.map((item) => ({
+    description: item.description,
+    quantity: item.qty,
+    unitPrice: item.unitPrice,
+    lineTotal: item.total,
+    qty: item.qty,
+    total: item.total,
+  }));
+
+  const subtotal = totalAmount;
+  const gst = 0;
+
   return {
+    supplierName,
     invoiceNumber,
     invoiceDate,
-    supplierName,
     poNumber,
     contractNumber,
     contractTerms,
-    lineItems,
+    paymentTerms: contractTerms || "Net 30",
+    lineItems: mappedLineItems,
+    subtotal,
+    gst,
     totalAmount,
+    confidence: {
+      invoiceNumber: "High" as const,
+      poNumber: poNumber ? ("High" as const) : ("Low" as const),
+      totalAmount: "High" as const,
+    },
   };
 }
 
@@ -322,22 +342,30 @@ async function startServer() {
           },
         });
 
-        const systemPrompt = `You are extracting structured data from ONE invoice or contract document.
-Read ONLY what is printed on THIS specific document. Do not infer, guess, autofill, or reuse values from any other document, sample, or prior result.
-
+        const systemPrompt = `You are extracting structured data from ONE invoice document.
+Read ONLY what is printed on THIS specific document. Do not infer, guess,
+autofill, or reuse values from any other document, sample, or prior result
+you may have seen.
 Extract exactly:
-- supplierName: the supplier/vendor company name as printed
-- invoiceNumber: the exact invoice number as printed (look for labels like "Invoice No.", "Invoice #", "INV-")
-- invoiceDate: the invoice date as printed (YYYY-MM-DD format if possible)
-- poNumber: the PO number referenced on THIS invoice, if shown (look for "PO No.", "P.O. Number", "Purchase Order #", "Order Ref"). If no PO number appears anywhere on the document, return an empty string — do not guess or reuse a PO number.
-- contractNumber: contract number, agreement ID, or contract reference (look for "Contract #", "Agreement No.", "MSA", "Contract Ref") if shown.
-- contractTerms: payment or contract terms as printed (e.g., "Net 30", "Net 60", "2% 10 Net 30", "30 days net").
-- lineItems: every line item with description, quantity (qty), unitPrice, and line total exactly as shown.
-- subtotal: subtotal amount as printed
-- totalAmount: total amount as printed
-- confidence: for invoiceNumber, poNumber, and totalAmount specifically, rate "High", "Medium", or "Low" based on legibility and presence in the source document.
-
-Before finalising, re-check invoiceNumber, poNumber, and contractNumber against the image or text one more time — pay close attention to easily confused characters such as 0 vs O, 1 vs I, 8 vs B.`;
+supplierName: the supplier/vendor company name as printed
+invoiceNumber: the exact invoice number as printed (look for labels like
+"Invoice No.", "Invoice #", "INV-")
+invoiceDate: the invoice date as printed
+poNumber: the PO number referenced on THIS invoice, if shown (look for
+"PO No.", "P.O. Number", "Purchase Order #"). If no PO number appears
+anywhere on the document, return an empty string — do not guess or
+reuse a PO number from elsewhere.
+paymentTerms: payment terms as printed (e.g. "30 days net")
+lineItems: every line item with description, quantity, unit price, and
+line total exactly as shown
+subtotal, gst, totalAmount: exactly as printed on the document
+confidence: for invoiceNumber, poNumber, and totalAmount specifically,
+rate "High", "Medium", or "Low" based on how legible/unambiguous that
+field was in the source image. If handwriting or image quality makes a
+field hard to read, mark it "Low" rather than guessing.
+Before finalising, re-check invoiceNumber and poNumber against the image
+one more time — pay close attention to easily confused characters such as
+0 vs O, 1 vs I, 8 vs B.`;
 
         let contents: any;
         if (base64Data) {
@@ -375,39 +403,41 @@ Before finalising, re-check invoiceNumber, poNumber, and contractNumber against 
               invoiceNumber: { type: Type.STRING },
               invoiceDate: { type: Type.STRING },
               poNumber: { type: Type.STRING },
-              contractNumber: { type: Type.STRING },
-              contractTerms: { type: Type.STRING },
+              paymentTerms: { type: Type.STRING },
               lineItems: {
                 type: Type.ARRAY,
                 items: {
                   type: Type.OBJECT,
                   properties: {
                     description: { type: Type.STRING },
-                    qty: { type: Type.NUMBER },
+                    quantity: { type: Type.NUMBER },
                     unitPrice: { type: Type.NUMBER },
-                    total: { type: Type.NUMBER },
+                    lineTotal: { type: Type.NUMBER },
                   },
-                  required: ["description", "qty", "unitPrice", "total"],
+                  required: ["description", "quantity", "unitPrice", "lineTotal"],
                 },
               },
               subtotal: { type: Type.NUMBER },
+              gst: { type: Type.NUMBER },
               totalAmount: { type: Type.NUMBER },
               confidence: {
                 type: Type.OBJECT,
                 properties: {
-                  invoiceNumber: { type: Type.STRING },
-                  poNumber: { type: Type.STRING },
-                  totalAmount: { type: Type.STRING },
+                  invoiceNumber: { type: Type.STRING, enum: ["High", "Medium", "Low"] },
+                  poNumber: { type: Type.STRING, enum: ["High", "Medium", "Low"] },
+                  totalAmount: { type: Type.STRING, enum: ["High", "Medium", "Low"] },
                 },
+                required: ["invoiceNumber", "poNumber", "totalAmount"],
               },
             },
             required: [
               "supplierName",
               "invoiceNumber",
               "invoiceDate",
-              "poNumber",
               "lineItems",
+              "subtotal",
               "totalAmount",
+              "confidence",
             ],
           },
         });
@@ -664,6 +694,404 @@ If a field is missing for a record, return empty string or 0. Normalize numeric 
       fallbackUsed: true,
       notice: "Extracted using smart document parser (Gemini free tier quota limit reached). You can review and adjust fields below.",
     });
+  });
+
+  // Google Sheets Auto-Sync Endpoint
+  app.post("/api/sheets/sync-invoice", async (req, res) => {
+    const { accessToken, spreadsheetId: rawSheetId, invoiceData } = req.body;
+
+    if (!accessToken) {
+      return res.status(401).json({
+        success: false,
+        error: "Google OAuth access token is missing. Please sign in with Google to enable live export.",
+      });
+    }
+
+    if (!rawSheetId || typeof rawSheetId !== "string" || !rawSheetId.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: "Target Google Sheet ID/URL is empty. Please enter your Google Sheet ID or URL in Settings.",
+      });
+    }
+
+    if (!invoiceData || !invoiceData.invoiceNumber) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid invoice data provided for sync.",
+      });
+    }
+
+    // Extract clean Spreadsheet ID from URL if full URL is pasted
+    let cleanSheetId = rawSheetId.trim();
+    const urlMatch = cleanSheetId.match(/\/d\/([a-zA-Z0-9-_]+)/);
+    if (urlMatch && urlMatch[1]) {
+      cleanSheetId = urlMatch[1];
+    }
+
+    const logs: string[] = [];
+
+    try {
+      logs.push(`Initiating Google Sheet export for Invoice #${invoiceData.invoiceNumber}`);
+      console.log(`[Google Sheets Export] Starting sync for Invoice #${invoiceData.invoiceNumber} (Sheet ID: ${cleanSheetId})`);
+
+      // 1. Fetch spreadsheet metadata to check existing tabs
+      const metaRes = await fetch(
+        `https://sheets.googleapis.com/v4/spreadsheets/${cleanSheetId}?fields=sheets.properties`,
+        {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        }
+      );
+
+      if (!metaRes.ok) {
+        const metaErr = await metaRes.json().catch(() => ({}));
+        const errMsg = metaErr.error?.message || `Google Sheets API Error (${metaRes.status})`;
+        logs.push(`Metadata lookup failed: ${errMsg}`);
+        console.error(`[Google Sheets Export] Metadata lookup error:`, metaErr);
+        return res.status(metaRes.status).json({
+          success: false,
+          error: `Google Sheets API Error: ${errMsg}. Check Sheet ID & permissions.`,
+          logs,
+        });
+      }
+
+      const metaData = await metaRes.json();
+      const existingSheets: Array<{ sheetId: number; title: string }> =
+        metaData.sheets?.map((s: any) => ({
+          sheetId: s.properties.sheetId,
+          title: s.properties.title,
+        })) || [];
+
+      // Determine classification and target/other tabs using strict explicit branching
+      const statusUpper = (invoiceData.status || "").toUpperCase();
+      const matchStatusUpper = (invoiceData.matchStatus || "").toUpperCase();
+      const rawStatus = (statusUpper === "APPROVED" || matchStatusUpper === "APPROVED" || statusUpper === "GREEN" || matchStatusUpper === "GREEN")
+        ? "APPROVED"
+        : (matchStatusUpper || statusUpper);
+
+      let targetTab = "";
+      let otherTab = "";
+      let matchStatusLabel = "";
+      let isApproved = false;
+
+      if (rawStatus === "APPROVED" || rawStatus === "GREEN") {
+        isApproved = true;
+        targetTab = "Approved Invoices";
+        otherTab = "Unapproved Invoices";
+        matchStatusLabel = "Approved";
+      } else if (rawStatus === "AMBER") {
+        isApproved = false;
+        targetTab = "Unapproved Invoices";
+        otherTab = "Approved Invoices";
+        matchStatusLabel = "Amber";
+      } else if (rawStatus === "RED" || rawStatus === "REJECTED") {
+        isApproved = false;
+        targetTab = "Unapproved Invoices";
+        otherTab = "Approved Invoices";
+        matchStatusLabel = "Red";
+      } else {
+        throw new Error(
+          `Invoice ${invoiceData.invoiceNumber} has an unrecognised matchStatus: "${rawStatus}". Refusing to write to sheet with an unknown status.`
+        );
+      }
+
+      logs.push(`Classification: ${matchStatusLabel} -> Writing to tab '${targetTab}'`);
+
+      // Ensure Target Tab exists with correct headers
+      let targetSheetObj = existingSheets.find((s) => s.title === targetTab);
+      const approvedHeaders = [
+        "Supplier Name",
+        "Invoice Number",
+        "Invoice Date",
+        "PO Reference",
+        "Quantity",
+        "Unit Price",
+        "Subtotal",
+        "GST Amount",
+        "Total Amount",
+        "Match Status",
+        "Date Processed",
+      ];
+      const unapprovedHeaders = [
+        "Supplier Name",
+        "Invoice Number",
+        "Invoice Date",
+        "PO Reference",
+        "Quantity",
+        "Unit Price",
+        "Subtotal",
+        "GST Amount",
+        "Total Amount",
+        "Match Status",
+        "Discrepancy Reason",
+        "Date Processed",
+      ];
+
+      const currentHeaders = isApproved ? approvedHeaders : unapprovedHeaders;
+
+      if (!targetSheetObj) {
+        logs.push(`Tab '${targetTab}' not found. Creating tab and header row...`);
+        const addSheetRes = await fetch(
+          `https://sheets.googleapis.com/v4/spreadsheets/${cleanSheetId}:batchUpdate`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              requests: [
+                {
+                  addSheet: {
+                    properties: { title: targetTab },
+                  },
+                },
+              ],
+            }),
+          }
+        );
+
+        if (!addSheetRes.ok) {
+          const addErr = await addSheetRes.json().catch(() => ({}));
+          throw new Error(`Failed to create tab '${targetTab}': ${addErr.error?.message || addSheetRes.statusText}`);
+        }
+
+        const addSheetData = await addSheetRes.json();
+        const newSheetId = addSheetData.replies?.[0]?.addSheet?.properties?.sheetId || 0;
+        targetSheetObj = { sheetId: newSheetId, title: targetTab };
+
+        // Set Headers
+        await fetch(
+          `https://sheets.googleapis.com/v4/spreadsheets/${cleanSheetId}/values/${encodeURIComponent(
+            targetTab
+          )}!A1:Z1?valueInputOption=USER_ENTERED`,
+          {
+            method: "PUT",
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              values: [currentHeaders],
+            }),
+          }
+        );
+        logs.push(`Created tab '${targetTab}' and initialized headers.`);
+      }
+
+      // Check and remove stale record from OTHER tab if classification changed
+      const otherSheetObj = existingSheets.find((s) => s.title === otherTab);
+      if (otherSheetObj) {
+        const otherValuesRes = await fetch(
+          `https://sheets.googleapis.com/v4/spreadsheets/${cleanSheetId}/values/${encodeURIComponent(
+            otherTab
+          )}!A1:Z500`,
+          {
+            headers: { Authorization: `Bearer ${accessToken}` },
+          }
+        );
+
+        if (otherValuesRes.ok) {
+          const otherData = await otherValuesRes.json();
+          const otherRows: string[][] = otherData.values || [];
+          
+          const staleRowIndex = otherRows.findIndex((row, idx) => {
+            if (idx === 0) return false; // skip header
+            const rowSupplier = (row[0] || "").trim().toLowerCase();
+            const rowInvNum = (row[1] || "").trim().toLowerCase();
+            const targetSupplier = (invoiceData.supplierName || "").trim().toLowerCase();
+            const targetInvNum = (invoiceData.invoiceNumber || "").trim().toLowerCase();
+            return (
+              rowInvNum === targetInvNum &&
+              (rowSupplier === targetSupplier || rowSupplier.includes(targetSupplier) || targetSupplier.includes(rowSupplier))
+            );
+          });
+
+          if (staleRowIndex > 0) {
+            logs.push(`Found stale duplicate row in '${otherTab}' at row ${staleRowIndex + 1}. Deleting stale row...`);
+            await fetch(
+              `https://sheets.googleapis.com/v4/spreadsheets/${cleanSheetId}:batchUpdate`,
+              {
+                method: "POST",
+                headers: {
+                  Authorization: `Bearer ${accessToken}`,
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  requests: [
+                    {
+                      deleteDimension: {
+                        range: {
+                          sheetId: otherSheetObj.sheetId,
+                          dimension: "ROWS",
+                          startIndex: staleRowIndex,
+                          endIndex: staleRowIndex + 1,
+                        },
+                      },
+                    },
+                  ],
+                }),
+              }
+            );
+            logs.push(`Successfully removed stale row from '${otherTab}'.`);
+          }
+        }
+      }
+
+      // Prepare Row Values for Target Tab
+      const items = Array.isArray(invoiceData.lineItems) ? invoiceData.lineItems : [];
+      let qtyValue: number | string = "";
+      let unitPriceValue: number | string = "";
+
+      if (items.length === 1) {
+        const rawQ = items[0].quantity ?? items[0].qty;
+        const rawP = items[0].unitPrice;
+        const parsedQ = Number(rawQ);
+        const parsedP = Number(rawP);
+        qtyValue = !isNaN(parsedQ) && rawQ !== "" && rawQ !== null ? parsedQ : (rawQ ?? 0);
+        unitPriceValue = !isNaN(parsedP) && rawP !== "" && rawP !== null ? parsedP : (rawP ?? 0);
+      } else if (items.length > 1) {
+        qtyValue = items.map((i: any) => i.quantity ?? i.qty ?? 0).join(", ");
+        unitPriceValue = items.map((i: any) => i.unitPrice ?? 0).join(", ");
+      }
+
+      const subtotalNum = Number(invoiceData.subtotal) || Number(invoiceData.totalAmount) || 0;
+      const gstNum = Number(invoiceData.gst) || 0;
+      const totalNum = Number(invoiceData.totalAmount) || 0;
+      const nowStr = invoiceData.syncedAt || new Date().toISOString().replace("T", " ").substring(0, 19);
+
+      let rowValues: any[];
+      if (isApproved) {
+        rowValues = [
+          invoiceData.supplierName || "",
+          invoiceData.invoiceNumber || "",
+          invoiceData.invoiceDate || "",
+          invoiceData.poNumber || "",
+          qtyValue,
+          unitPriceValue,
+          subtotalNum,
+          gstNum,
+          totalNum,
+          "Approved",
+          nowStr,
+        ];
+      } else {
+        rowValues = [
+          invoiceData.supplierName || "",
+          invoiceData.invoiceNumber || "",
+          invoiceData.invoiceDate || "",
+          invoiceData.poNumber || "",
+          qtyValue,
+          unitPriceValue,
+          subtotalNum,
+          gstNum,
+          totalNum,
+          matchStatusLabel,
+          invoiceData.discrepancyReason || "Pending 3-way match verification",
+          nowStr,
+        ];
+      }
+
+      // Fetch existing rows in Target Tab to check for updates vs appends
+      const targetValuesRes = await fetch(
+        `https://sheets.googleapis.com/v4/spreadsheets/${cleanSheetId}/values/${encodeURIComponent(
+          targetTab
+        )}!A1:Z500`,
+        {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        }
+      );
+
+      let existingRowIndex = -1;
+      if (targetValuesRes.ok) {
+        const targetData = await targetValuesRes.json();
+        const targetRows: string[][] = targetData.values || [];
+
+        existingRowIndex = targetRows.findIndex((row, idx) => {
+          if (idx === 0) return false;
+          const rowSupplier = (row[0] || "").trim().toLowerCase();
+          const rowInvNum = (row[1] || "").trim().toLowerCase();
+          const targetSupplier = (invoiceData.supplierName || "").trim().toLowerCase();
+          const targetInvNum = (invoiceData.invoiceNumber || "").trim().toLowerCase();
+          return (
+            rowInvNum === targetInvNum &&
+            (rowSupplier === targetSupplier || rowSupplier.includes(targetSupplier) || targetSupplier.includes(rowSupplier))
+          );
+        });
+      }
+
+      let writeAction = "appended";
+
+      if (existingRowIndex > 0) {
+        // Update existing row
+        const rowNumber = existingRowIndex + 1;
+        logs.push(`Updating existing record in '${targetTab}' at row ${rowNumber}`);
+        const updateRes = await fetch(
+          `https://sheets.googleapis.com/v4/spreadsheets/${cleanSheetId}/values/${encodeURIComponent(
+            targetTab
+          )}!A${rowNumber}?valueInputOption=USER_ENTERED`,
+          {
+            method: "PUT",
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              values: [rowValues],
+            }),
+          }
+        );
+
+        if (!updateRes.ok) {
+          const updateErr = await updateRes.json().catch(() => ({}));
+          throw new Error(`Failed to update row in '${targetTab}': ${updateErr.error?.message || updateRes.statusText}`);
+        }
+        writeAction = `updated row ${rowNumber}`;
+      } else {
+        // Append new row
+        logs.push(`Appending new record to '${targetTab}'`);
+        const appendRes = await fetch(
+          `https://sheets.googleapis.com/v4/spreadsheets/${cleanSheetId}/values/${encodeURIComponent(
+            targetTab
+          )}!A1:append?valueInputOption=USER_ENTERED`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              values: [rowValues],
+            }),
+          }
+        );
+
+        if (!appendRes.ok) {
+          const appendErr = await appendRes.json().catch(() => ({}));
+          throw new Error(`Failed to append row to '${targetTab}': ${appendErr.error?.message || appendRes.statusText}`);
+        }
+      }
+
+      logs.push(`SUCCESS: Written Invoice #${invoiceData.invoiceNumber} to '${targetTab}' (${writeAction})`);
+      console.log(`[Google Sheets Export] Sync completed for Invoice #${invoiceData.invoiceNumber} to ${targetTab}`);
+
+      return res.json({
+        success: true,
+        targetTab,
+        action: writeAction,
+        sheetId: cleanSheetId,
+        invoiceNumber: invoiceData.invoiceNumber,
+        syncedAt: nowStr,
+        logs,
+      });
+    } catch (err: any) {
+      console.error("[Google Sheets Export] Fatal error:", err);
+      logs.push(`ERROR: ${err.message || err}`);
+      return res.status(500).json({
+        success: false,
+        error: err.message || "Failed to sync invoice to Google Sheets",
+        logs,
+      });
+    }
   });
 
   // Vite middleware for development

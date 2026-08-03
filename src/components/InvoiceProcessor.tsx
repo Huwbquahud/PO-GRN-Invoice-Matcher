@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { Invoice, InvoiceLineItem, MatchResult } from "../types";
+import { extractInvoiceData, ExtractedInvoiceData } from "../utils/invoiceExtraction";
 import {
   FileText,
   Upload,
@@ -15,6 +16,7 @@ import {
   Edit,
   Loader2,
   AlertCircle,
+  ShieldCheck,
 } from "lucide-react";
 
 interface InvoiceProcessorProps {
@@ -51,11 +53,19 @@ export const InvoiceProcessor: React.FC<InvoiceProcessorProps> = ({
   const [poNumber, setPoNumber] = useState("");
   const [contractNumber, setContractNumber] = useState("");
   const [contractTerms, setContractTerms] = useState("");
+  const [paymentTerms, setPaymentTerms] = useState("");
   const [invoiceDate, setInvoiceDate] = useState(new Date().toISOString().split("T")[0]);
   const [lineItems, setLineItems] = useState<InvoiceLineItem[]>([
     { description: "", qty: 1, unitPrice: 0, total: 0 },
   ]);
+  const [subtotal, setSubtotal] = useState<number>(0);
+  const [gst, setGst] = useState<number>(0);
   const [totalAmount, setTotalAmount] = useState<number>(0);
+  const [confidence, setConfidence] = useState<{
+    invoiceNumber?: "High" | "Medium" | "Low";
+    poNumber?: "High" | "Medium" | "Low";
+    totalAmount?: "High" | "Medium" | "Low";
+  }>({});
 
   // File drop handler
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -77,42 +87,47 @@ export const InvoiceProcessor: React.FC<InvoiceProcessorProps> = ({
     setExtractionNotice("");
 
     try {
-      const response = await fetch("/api/extract-invoice", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          invoiceContent: invoiceText || undefined,
-          mimeType: selectedFile?.type || undefined,
-          base64Data: fileBase64 || undefined,
-        }),
-      });
+      let data: ExtractedInvoiceData | any;
 
-      const result = await response.json();
+      if (selectedFile) {
+        // Use client wrapper calling fresh server endpoint
+        data = await extractInvoiceData(selectedFile);
+      } else {
+        const response = await fetch("/api/extract-invoice", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            invoiceContent: invoiceText || undefined,
+            mimeType: selectedFile?.type || undefined,
+            base64Data: fileBase64 || undefined,
+          }),
+        });
 
-      if (!response.ok || !result.success) {
-        throw new Error(result.error || "Extraction failed");
+        const result = await response.json();
+        if (!response.ok || !result.success) {
+          throw new Error(result.error || "Extraction failed");
+        }
+        if (result.notice) {
+          setExtractionNotice(result.notice);
+        }
+        data = result.data;
       }
 
-      if (result.notice) {
-        setExtractionNotice(result.notice);
-      }
-
-      const data = result.data;
-      setInvoiceNumber(data.invoiceNumber || `INV-${Math.floor(1000 + Math.random() * 9000)}`);
+      setInvoiceNumber(data.invoiceNumber || "");
       setSupplierName(data.supplierName || "");
       setPoNumber(data.poNumber || "");
-      setContractNumber(data.contractNumber || "");
-      setContractTerms(data.contractTerms || data.paymentTerms || "");
+      setPaymentTerms(data.paymentTerms || "");
+      setContractTerms(data.paymentTerms || data.contractTerms || "");
       setInvoiceDate(data.invoiceDate || new Date().toISOString().split("T")[0]);
 
       if (data.lineItems && Array.isArray(data.lineItems) && data.lineItems.length > 0) {
         setLineItems(
           data.lineItems.map((item: any) => {
-            const quantity = Number(item.qty ?? item.quantity) || 1;
+            const quantity = Number(item.quantity ?? item.qty) || 1;
             const unitPrice = Number(item.unitPrice) || 0;
-            const lineTotal = Number(item.total ?? item.lineTotal) || quantity * unitPrice || 0;
+            const lineTotal = Number(item.lineTotal ?? item.total) || quantity * unitPrice || 0;
             return {
-              description: item.description || "Unspecified Item",
+              description: item.description || "Unspecified Hardware Item",
               qty: quantity,
               unitPrice: unitPrice,
               total: lineTotal,
@@ -121,7 +136,12 @@ export const InvoiceProcessor: React.FC<InvoiceProcessorProps> = ({
         );
       }
 
+      setSubtotal(Number(data.subtotal) || Number(data.totalAmount) || 0);
+      setGst(Number(data.gst) || 0);
       setTotalAmount(Number(data.totalAmount) || 0);
+      if (data.confidence) {
+        setConfidence(data.confidence);
+      }
     } catch (err: any) {
       console.error(err);
       setExtractionError(err.message || "Failed to extract invoice using Gemini AI.");
@@ -502,62 +522,112 @@ export const InvoiceProcessor: React.FC<InvoiceProcessorProps> = ({
 
             {/* Extracted Fields Form */}
             <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-4 shadow-xs">
-              <h4 className="text-xs font-mono font-bold text-slate-700 uppercase tracking-wider">
-                Review & Edit Extracted Invoice Fields
-              </h4>
+              <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-200">
+                <h4 className="text-xs font-mono font-bold text-slate-700 uppercase tracking-wider flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-emerald-600" />
+                  Review & Edit Extracted Invoice Fields
+                </h4>
 
-              <div className="grid sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 text-xs">
+                {confidence.invoiceNumber && (
+                  <div className="flex items-center gap-2 text-[10px]">
+                    <span className="text-slate-500 font-medium">Confidence Ratings:</span>
+                    <span
+                      className={`px-2 py-0.5 rounded font-semibold border ${
+                        confidence.invoiceNumber === "High"
+                          ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                          : confidence.invoiceNumber === "Medium"
+                          ? "bg-amber-50 text-amber-700 border-amber-200"
+                          : "bg-rose-50 text-rose-700 border-rose-200"
+                      }`}
+                    >
+                      Inv #: {confidence.invoiceNumber}
+                    </span>
+                    <span
+                      className={`px-2 py-0.5 rounded font-semibold border ${
+                        confidence.poNumber === "High"
+                          ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                          : confidence.poNumber === "Medium"
+                          ? "bg-amber-50 text-amber-700 border-amber-200"
+                          : "bg-rose-50 text-rose-700 border-rose-200"
+                      }`}
+                    >
+                      PO #: {confidence.poNumber}
+                    </span>
+                    <span
+                      className={`px-2 py-0.5 rounded font-semibold border ${
+                        confidence.totalAmount === "High"
+                          ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                          : confidence.totalAmount === "Medium"
+                          ? "bg-amber-50 text-amber-700 border-amber-200"
+                          : "bg-rose-50 text-rose-700 border-rose-200"
+                      }`}
+                    >
+                      Total: {confidence.totalAmount}
+                    </span>
+                  </div>
+                )}
+              </div>
+
+              <div className="grid sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3 text-xs">
                 <div>
-                  <label className="block font-medium text-slate-600 mb-1">Invoice Number</label>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="font-medium text-slate-600">Supplier Name</label>
+                  </div>
+                  <input
+                    type="text"
+                    value={supplierName}
+                    onChange={(e) => setSupplierName(e.target.value)}
+                    placeholder="e.g. Acme Hardware & Tooling Ltd"
+                    className="w-full bg-white border border-slate-300 rounded-md p-2 text-slate-900 font-medium"
+                  />
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="font-medium text-slate-600">Invoice Number</label>
+                    {confidence.invoiceNumber && (
+                      <span className="text-[9px] font-mono text-slate-400">
+                        [{confidence.invoiceNumber}]
+                      </span>
+                    )}
+                  </div>
                   <input
                     type="text"
                     value={invoiceNumber}
                     onChange={(e) => setInvoiceNumber(e.target.value)}
                     placeholder="e.g. INV-2026-001"
-                    className="w-full bg-white border border-slate-300 rounded-md p-2 text-slate-900 font-mono"
+                    className="w-full bg-white border border-slate-300 rounded-md p-2 text-slate-900 font-mono font-bold"
                   />
                 </div>
 
                 <div>
-                  <label className="block font-medium text-slate-600 mb-1">Supplier Name</label>
-                  <input
-                    type="text"
-                    value={supplierName}
-                    onChange={(e) => setSupplierName(e.target.value)}
-                    placeholder="e.g. Acme Hardware"
-                    className="w-full bg-white border border-slate-300 rounded-md p-2 text-slate-900"
-                  />
-                </div>
-
-                <div>
-                  <label className="block font-medium text-slate-600 mb-1">PO Reference Number</label>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="font-medium text-slate-600">PO Number</label>
+                    {confidence.poNumber && (
+                      <span className="text-[9px] font-mono text-slate-400">
+                        [{confidence.poNumber}]
+                      </span>
+                    )}
+                  </div>
                   <input
                     type="text"
                     value={poNumber}
                     onChange={(e) => setPoNumber(e.target.value)}
                     placeholder="e.g. PO-1001"
-                    className="w-full bg-white border border-slate-300 rounded-md p-2 text-slate-900 font-mono"
+                    className="w-full bg-white border border-slate-300 rounded-md p-2 text-slate-900 font-mono font-bold text-blue-700"
                   />
                 </div>
 
                 <div>
-                  <label className="block font-medium text-slate-600 mb-1">Contract / Ref #</label>
+                  <label className="block font-medium text-slate-600 mb-1">Payment Terms</label>
                   <input
                     type="text"
-                    value={contractNumber}
-                    onChange={(e) => setContractNumber(e.target.value)}
-                    placeholder="e.g. CON-2026-882"
-                    className="w-full bg-white border border-slate-300 rounded-md p-2 text-slate-900 font-mono"
-                  />
-                </div>
-
-                <div>
-                  <label className="block font-medium text-slate-600 mb-1">Payment / Contract Terms</label>
-                  <input
-                    type="text"
-                    value={contractTerms}
-                    onChange={(e) => setContractTerms(e.target.value)}
-                    placeholder="e.g. Net 30"
+                    value={contractTerms || paymentTerms}
+                    onChange={(e) => {
+                      setContractTerms(e.target.value);
+                      setPaymentTerms(e.target.value);
+                    }}
+                    placeholder="e.g. 30 days net"
                     className="w-full bg-white border border-slate-300 rounded-md p-2 text-slate-900"
                   />
                 </div>
@@ -576,7 +646,7 @@ export const InvoiceProcessor: React.FC<InvoiceProcessorProps> = ({
               {/* Line Items List */}
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
-                  <label className="block text-xs font-semibold text-slate-700">Invoice Line Items</label>
+                  <label className="block text-xs font-semibold text-slate-700">Line Items (Description, Quantity, Unit Price, Line Total)</label>
                   <button
                     onClick={handleAddLineItem}
                     className="text-xs text-blue-700 font-semibold hover:underline flex items-center gap-1"
@@ -590,7 +660,7 @@ export const InvoiceProcessor: React.FC<InvoiceProcessorProps> = ({
                   <div key={idx} className="grid grid-cols-12 gap-2 text-xs items-center">
                     <input
                       type="text"
-                      placeholder="Item description"
+                      placeholder="Item description (e.g. M8 Stainless Bolts)"
                       value={item.description}
                       onChange={(e) => handleUpdateLineItem(idx, "description", e.target.value)}
                       className="col-span-5 bg-white border border-slate-300 rounded p-1.5 text-slate-800"
@@ -622,9 +692,11 @@ export const InvoiceProcessor: React.FC<InvoiceProcessorProps> = ({
                 ))}
               </div>
 
-              <div className="flex items-center justify-between border-t border-slate-200 pt-3">
-                <div className="text-xs text-slate-600">
-                  Grand Total: <strong className="text-emerald-700 text-sm font-mono">${totalAmount.toFixed(2)}</strong>
+              <div className="flex flex-wrap items-center justify-between gap-4 border-t border-slate-200 pt-3">
+                <div className="flex items-center gap-4 text-xs text-slate-600 font-mono">
+                  <span>Subtotal: <strong>${(subtotal || lineItems.reduce((a, b) => a + b.total, 0)).toFixed(2)}</strong></span>
+                  {gst > 0 && <span>GST: <strong>${gst.toFixed(2)}</strong></span>}
+                  <span>Total Amount: <strong className="text-emerald-700 text-sm font-bold">${(totalAmount || lineItems.reduce((a, b) => a + b.total, 0)).toFixed(2)}</strong></span>
                 </div>
 
                 <button

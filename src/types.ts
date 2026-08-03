@@ -40,6 +40,8 @@ export interface Invoice {
   contractNumber?: string;
   contractTerms?: string;
   lineItems: InvoiceLineItem[];
+  subtotal?: number;
+  gst?: number;
   totalAmount: number;
   status?: 'PENDING' | 'GREEN' | 'AMBER' | 'RED' | 'APPROVED' | 'REJECTED';
   reviewNotes?: string;
