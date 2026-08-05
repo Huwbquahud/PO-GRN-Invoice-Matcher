@@ -696,6 +696,75 @@ If a field is missing for a record, return empty string or 0. Normalize numeric 
     });
   });
 
+  // Google Sheets App 1 Bulk Import Endpoint (Single Call)
+  app.post("/api/sheets/import-app1", async (req, res) => {
+    const { accessToken, spreadsheetId: rawSheetId, tabName } = req.body;
+
+    if (!accessToken) {
+      return res.status(401).json({
+        success: false,
+        error: "Google OAuth access token is missing. Please sign in with Google to enable sheet import.",
+      });
+    }
+
+    if (!rawSheetId || typeof rawSheetId !== "string" || !rawSheetId.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: "App 1 Source Google Sheet ID/URL is empty. Please enter the Sheet ID or URL in Settings.",
+      });
+    }
+
+    let cleanSheetId = rawSheetId.trim();
+    const urlMatch = cleanSheetId.match(/\/d\/([a-zA-Z0-9-_]+)/);
+    if (urlMatch && urlMatch[1]) {
+      cleanSheetId = urlMatch[1];
+    }
+
+    const targetTab = (tabName || "Verified Invoices").trim();
+    const range = `${targetTab}!A1:I1000`;
+
+    try {
+      console.log(`[App 1 Import] Single API call fetching range '${range}' for Sheet ID: ${cleanSheetId}`);
+
+      // ONE SINGLE API CALL to retrieve the full used range
+      const sheetRes = await fetch(
+        `https://sheets.googleapis.com/v4/spreadsheets/${cleanSheetId}/values/${encodeURIComponent(range)}?valueRenderOption=FORMATTED_VALUE`,
+        {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        }
+      );
+
+      if (!sheetRes.ok) {
+        const errJson = await sheetRes.json().catch(() => ({}));
+        const errMsg = errJson.error?.message || `Google Sheets API Error (${sheetRes.status})`;
+        console.error(`[App 1 Import] API fetch error:`, errJson);
+        return res.status(sheetRes.status).json({
+          success: false,
+          error: `Google Sheets API Error: ${errMsg}. Ensure tab '${targetTab}' exists and Google Account has access.`,
+        });
+      }
+
+      const sheetData = await sheetRes.json();
+      const rows: string[][] = sheetData.values || [];
+
+      console.log(`[App 1 Import] Successfully retrieved ${rows.length} rows in a single API call from tab '${targetTab}'`);
+
+      return res.json({
+        success: true,
+        spreadsheetId: cleanSheetId,
+        tabName: targetTab,
+        totalRows: rows.length,
+        rows,
+      });
+    } catch (err: any) {
+      console.error(`[App 1 Import] Server exception:`, err);
+      return res.status(500).json({
+        success: false,
+        error: err.message || "Failed to connect to Google Sheets API.",
+      });
+    }
+  });
+
   // Google Sheets Auto-Sync Endpoint
   app.post("/api/sheets/sync-invoice", async (req, res) => {
     const { accessToken, spreadsheetId: rawSheetId, invoiceData } = req.body;

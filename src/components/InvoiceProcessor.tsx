@@ -1,6 +1,12 @@
 import React, { useState } from "react";
-import { Invoice, InvoiceLineItem, MatchResult } from "../types";
+import { Invoice, InvoiceLineItem, MatchResult, PurchaseOrder, GoodsReceivedNote, PaymentRecord } from "../types";
 import { extractInvoiceData, ExtractedInvoiceData } from "../utils/invoiceExtraction";
+import {
+  getApp1StoredSheetId,
+  setApp1StoredSheetId,
+  importApp1InvoicesBulk,
+  ImportApp1Summary,
+} from "../services/app1Import";
 import {
   FileText,
   Upload,
@@ -17,6 +23,9 @@ import {
   Loader2,
   AlertCircle,
   ShieldCheck,
+  Download,
+  DownloadCloud,
+  X,
 } from "lucide-react";
 
 interface InvoiceProcessorProps {
@@ -26,6 +35,10 @@ interface InvoiceProcessorProps {
   onDeleteInvoice: (id: string) => void;
   selectedInvoiceId?: string;
   onLoadBenchmarkSuite?: () => void;
+  onImportApp1Batch?: (invoices: Invoice[], summaryMessage: string) => void;
+  purchaseOrders?: PurchaseOrder[];
+  grns?: GoodsReceivedNote[];
+  paymentHistory?: PaymentRecord[];
 }
 
 export const InvoiceProcessor: React.FC<InvoiceProcessorProps> = ({
@@ -35,13 +48,46 @@ export const InvoiceProcessor: React.FC<InvoiceProcessorProps> = ({
   onDeleteInvoice,
   selectedInvoiceId,
   onLoadBenchmarkSuite,
+  onImportApp1Batch,
+  purchaseOrders = [],
+  grns = [],
+  paymentHistory = [],
 }) => {
   const [activeSubTab, setActiveSubTab] = useState<'queue' | 'ai_upload' | 'manual'>('queue');
   const [searchTerm, setSearchTerm] = useState("");
 
+  // App 1 Source Sheet import local state
+  const [app1SheetInput, setApp1SheetInput] = useState<string>(() => getApp1StoredSheetId());
+  const [isImportingApp1, setIsImportingApp1] = useState(false);
+  const [importSummaryModal, setImportSummaryModal] = useState<ImportApp1Summary | null>(null);
+
   // AI Extractor state
   const [invoiceText, setInvoiceText] = useState("");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+
+  const handleApp1ImportClick = async () => {
+    setIsImportingApp1(true);
+    try {
+      const summary = await importApp1InvoicesBulk(
+        invoices,
+        purchaseOrders,
+        grns,
+        paymentHistory,
+        app1SheetInput
+      );
+
+      if (summary.success && summary.importedInvoices.length > 0 && onImportApp1Batch) {
+        onImportApp1Batch(summary.importedInvoices, summary.message);
+      }
+
+      setImportSummaryModal(summary);
+    } catch (err: any) {
+      console.error("App 1 Import error:", err);
+      alert("Failed to import App 1 invoices: " + (err.message || err));
+    } finally {
+      setIsImportingApp1(false);
+    }
+  };
   const [fileBase64, setFileBase64] = useState<string>("");
   const [isExtracting, setIsExtracting] = useState(false);
   const [extractionError, setExtractionError] = useState("");
@@ -271,6 +317,51 @@ export const InvoiceProcessor: React.FC<InvoiceProcessorProps> = ({
         {activeSubTab === "queue" && (
           <div className="space-y-4">
             
+            {/* App 1 Source Sheet Bulk Import Banner */}
+            <div className="bg-sky-50 border border-sky-200 rounded-xl p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-sky-900 shadow-xs">
+              <div className="flex items-center gap-2.5 flex-1 min-w-[280px]">
+                <DownloadCloud className="w-5 h-5 text-sky-600 shrink-0" />
+                <div className="flex-1 space-y-1">
+                  <div className="flex items-center gap-2">
+                    <span className="font-bold text-sky-950">App 1 Google Sheet Linkage:</span>
+                    <span className="text-[11px] bg-sky-200/70 text-sky-900 px-2 py-0.5 rounded font-mono font-medium">
+                      Tab: Verified Invoices
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={app1SheetInput}
+                      onChange={(e) => {
+                        setApp1SheetInput(e.target.value);
+                        setApp1StoredSheetId(e.target.value);
+                      }}
+                      placeholder="App 1 Source Google Sheet ID or URL (e.g. 1ABC123... or https://docs.google.com/...)"
+                      className="w-full bg-white border border-sky-300 rounded-md px-2.5 py-1 text-xs text-slate-800 placeholder-slate-400 font-mono focus:outline-none focus:border-sky-500"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <button
+                onClick={handleApp1ImportClick}
+                disabled={isImportingApp1}
+                className="bg-sky-700 hover:bg-sky-800 text-white font-bold px-4 py-2 rounded-lg text-xs transition flex items-center justify-center gap-2 shadow-sm disabled:opacity-50 cursor-pointer shrink-0"
+              >
+                {isImportingApp1 ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <span>Reading Sheet...</span>
+                  </>
+                ) : (
+                  <>
+                    <Download className="w-4 h-4" />
+                    <span>Import All Invoices from App 1</span>
+                  </>
+                )}
+              </button>
+            </div>
+
             {/* Search & Actions Bar */}
             <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
               <div className="relative w-full sm:w-72">
@@ -804,6 +895,65 @@ export const InvoiceProcessor: React.FC<InvoiceProcessorProps> = ({
         )}
 
       </div>
+
+      {/* App 1 Import Summary Modal */}
+      {importSummaryModal && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 text-slate-900">
+          <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full p-5 border border-slate-200 space-y-4">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-200">
+              <div className="flex items-center gap-2 text-sky-700 font-bold text-sm">
+                <Download className="w-5 h-5 text-sky-600" />
+                <span>App 1 Bulk Import Results</span>
+              </div>
+              <button
+                onClick={() => setImportSummaryModal(null)}
+                className="text-slate-400 hover:text-slate-600 rounded-lg p-1 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-3 text-xs">
+              <div className={`p-3.5 rounded-lg font-medium border ${
+                importSummaryModal.success 
+                  ? "bg-sky-50 border-sky-200 text-sky-900 font-semibold" 
+                  : "bg-rose-50 border-rose-200 text-rose-900 font-semibold"
+              }`}>
+                {importSummaryModal.message}
+              </div>
+
+              {importSummaryModal.skippedDetails && importSummaryModal.skippedDetails.length > 0 && (
+                <div>
+                  <label className="font-semibold text-slate-700 block mb-1">
+                    Skipped / Malformed Rows Details ({importSummaryModal.skippedRowsCount}):
+                  </label>
+                  <ul className="bg-slate-50 border border-slate-200 p-3 rounded-lg font-mono text-[11px] max-h-36 overflow-y-auto space-y-1 text-slate-700">
+                    {importSummaryModal.skippedDetails.map((detail, idx) => (
+                      <li key={idx} className="flex items-start gap-1.5">
+                        <span className="text-amber-500 font-bold">•</span>
+                        <span>{detail}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              <p className="text-slate-500 text-[11px]">
+                Note: Invoices were fetched via a single bulk Google Sheets API request for tab <strong className="font-mono text-slate-700">Verified Invoices</strong>. Clean Records undergo standard 3-way matching, while Duplicate/Missing POs are pre-classified directly as RED.
+              </p>
+            </div>
+
+            <div className="pt-3 border-t border-slate-200 flex justify-end">
+              <button
+                onClick={() => setImportSummaryModal(null)}
+                className="bg-slate-900 hover:bg-slate-800 text-white px-4 py-2 rounded-lg font-semibold text-xs transition cursor-pointer"
+              >
+                Close Summary
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
     </div>
   );

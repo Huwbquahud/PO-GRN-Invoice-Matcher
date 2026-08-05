@@ -102,13 +102,24 @@ export default function App() {
     showToast("Invoice removed from queue.");
   };
 
+  const handleImportApp1Batch = (newInvoices: Invoice[], summaryMessage: string) => {
+    setVerifiedInvoices((prev) => [...newInvoices, ...prev]);
+    showToast(`Batch imported ${newInvoices.length} invoice(s) from App 1.`);
+  };
+
   const pendingCount = verifiedInvoices.filter((i) => i.status === "PENDING").length;
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 font-sans flex flex-col">
       
       {/* Target Google Sheet Settings & Live Sync Status Bar */}
-      <GoogleSheetsSyncBar />
+      <GoogleSheetsSyncBar
+        verifiedInvoices={verifiedInvoices}
+        onImportApp1Batch={handleImportApp1Batch}
+        purchaseOrders={purchaseOrders}
+        grns={grns}
+        paymentHistory={paymentHistory}
+      />
 
       {/* Top Application Navigation & User Header */}
       <Header
@@ -179,6 +190,10 @@ export default function App() {
             onDeleteInvoice={handleDeleteInvoice}
             selectedInvoiceId={selectedInvoiceId}
             onLoadBenchmarkSuite={handleLoadBenchmarkWithToast}
+            onImportApp1Batch={handleImportApp1Batch}
+            purchaseOrders={purchaseOrders}
+            grns={grns}
+            paymentHistory={paymentHistory}
           />
         )}
 
